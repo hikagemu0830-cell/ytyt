@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: TARGET
+        value: https://www.b-ch.com
