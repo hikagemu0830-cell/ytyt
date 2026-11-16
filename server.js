@@ -33,6 +33,18 @@ const MAX_BODY_BYTES = 100 * 1024 * 1024;
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
+// 日本からのアクセスに見せる設定
+//  UPSTREAM_PROXY  日本にある HTTP(S) プロキシ（例 http://user:pass@jp-proxy.example.com:8080）。
+//                  設定すると、上流サイトへの通信（WebSocket含む）はすべてこれ経由になる。要 npm i undici
+//  FORCE_JA        既定で有効。Accept-Language を日本語に固定（0 で無効）
+const UPSTREAM_PROXY = process.env.UPSTREAM_PROXY || "";
+const FORCE_JA = process.env.FORCE_JA !== "0";
+let DISPATCHER;
+if (UPSTREAM_PROXY) {
+  const { ProxyAgent } = await import("undici");
+  DISPATCHER = new ProxyAgent(UPSTREAM_PROXY);
+}
+
 const BASE = new URL(TARGET);
 const BARE = BASE.hostname.replace(/^www\./i, "");
 const SITE_HOSTS = [BARE, "www." + BARE];
@@ -270,6 +282,7 @@ function buildUpstreamHeaders(req, upstream, myOrigin) {
     else if (v != null) h.set(k, v);
   }
   if (!h.has("user-agent")) h.set("user-agent", DEFAULT_UA);
+  if (FORCE_JA || !h.has("accept-language")) h.set("accept-language", "ja,ja-JP;q=0.9,en-US;q=0.5,en;q=0.4");
   const cookie = cookieFor(req, upstream.hostname);
   if (cookie) h.set("cookie", cookie);
   const ref = req.headers.referer ? realFromProxyUrl(req.headers.referer, myOrigin) : null;
@@ -318,7 +331,7 @@ async function fetchUpstream(upstream, init, canRetry, res) {
     res.once("close", onClose);
     const timer = setTimeout(() => ac.abort(new Error("upstream timeout")), HEADER_TIMEOUT);
     try {
-      const r = await fetch(upstream, { ...init, signal: ac.signal, redirect: "manual" });
+      const r = await fetch(upstream, { ...init, signal: ac.signal, redirect: "manual", ...(DISPATCHER ? { dispatcher: DISPATCHER } : {}) });
       clearTimeout(timer);
       if (canRetry && [502, 503, 504].includes(r.status) && i < tries) {
         res.off("close", onClose);
@@ -469,6 +482,38 @@ async function handle(req, res) {
 }
 
 // ───────────────────────── WebSocket 中継 ─────────────────────────
+// 上流への接続を開く（UPSTREAM_PROXY があれば HTTP CONNECT 経由）
+function connectUp(secure, hostname, port) {
+  return new Promise((resolve, reject) => {
+    const secureOver = (sock) => {
+      const t = tls.connect(sock ? { socket: sock, servername: hostname } : { host: hostname, port, servername: hostname });
+      t.once("secureConnect", () => resolve(t));
+      t.once("error", reject);
+    };
+    if (!UPSTREAM_PROXY) {
+      if (secure) return secureOver(null);
+      const s = net.connect({ host: hostname, port });
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+      return;
+    }
+    const pu = new URL(UPSTREAM_PROXY);
+    const headers = { host: `${hostname}:${port}` };
+    if (pu.username)
+      headers["proxy-authorization"] = "Basic " + Buffer.from(decodeURIComponent(pu.username) + ":" + decodeURIComponent(pu.password)).toString("base64");
+    const creq = http.request({ host: pu.hostname, port: pu.port || 80, method: "CONNECT", path: `${hostname}:${port}`, headers });
+    creq.once("connect", (r, sock) => {
+      if (r.statusCode !== 200) {
+        sock.destroy();
+        return reject(new Error("proxy CONNECT " + r.statusCode));
+      }
+      secure ? secureOver(sock) : resolve(sock);
+    });
+    creq.once("error", reject);
+    creq.end();
+  });
+}
+
 function handleUpgrade(req, socket, head) {
   try {
     const url = new URL("http://local" + req.url);
@@ -481,9 +526,9 @@ function handleUpgrade(req, socket, head) {
     const hostname = hm[1];
     const port = Number(hm[2]) || (secure ? 443 : 80);
     assertPublic(hostname)
-      .then(() => {
-        const up = secure ? tls.connect({ host: hostname, port, servername: hostname }) : net.connect({ host: hostname, port });
-        up.once(secure ? "secureConnect" : "connect", () => {
+      .then(() => connectUp(secure, hostname, port))
+      .then((up) => {
+        {
           const lines = [`GET ${path} HTTP/1.1`, `Host: ${hostport}`];
           for (let i = 0; i < req.rawHeaders.length; i += 2) {
             const k = req.rawHeaders[i];
@@ -498,7 +543,7 @@ function handleUpgrade(req, socket, head) {
           if (head && head.length) up.write(head);
           socket.pipe(up);
           up.pipe(socket);
-        });
+        }
         up.on("error", () => socket.destroy());
         up.on("close", () => socket.destroy());
         socket.on("error", () => up.destroy());
